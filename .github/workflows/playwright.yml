@@ -1,0 +1,210 @@
+name: Playwright Tests
+
+on:
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Install Playwright Browsers
+      run: npx playwright install --with-deps
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Create mock weather server
+      run: |
+        cat > mock-weather-server-ci.js << 'EOF'
+        #!/usr/bin/env node
+        
+        // Simple mock weather server for CI testing
+        const http = require('http');
+        
+        const mockWeatherData = {
+          "東京": {
+            temperature: "25℃",
+            humidity: "60%",
+            conditions: "晴れ",
+            description: "東京の今日の天気は晴れ、最高気温25℃の予報です。"
+          },
+          "大阪": {
+            temperature: "23℃", 
+            humidity: "65%",
+            conditions: "曇り",
+            description: "大阪の今日の天気は曇り、最高気温23℃の予報です。"
+          },
+          "名古屋": {
+            temperature: "24℃",
+            humidity: "55%", 
+            conditions: "晴れ時々曇り",
+            description: "名古屋の今日の天気は晴れ時々曇り、最高気温24℃の予報です。"
+          }
+        };
+        
+        // Mock MCP server that responds to get-forecast tool calls
+        process.stdin.on('data', (data) => {
+          try {
+            const request = JSON.parse(data.toString());
+            
+            if (request.method === 'tools/list') {
+              const response = {
+                jsonrpc: '2.0',
+                id: request.id,
+                result: {
+                  tools: [
+                    {
+                      name: 'get-forecast',
+                      description: 'Get weather forecast for a region',
+                      inputSchema: {
+                        type: 'object',
+                        properties: {
+                          regionId: {
+                            type: 'string',
+                            description: 'Region ID for weather forecast'
+                          }
+                        },
+                        required: ['regionId']
+                      }
+                    }
+                  ]
+                }
+              };
+              process.stdout.write(JSON.stringify(response) + '\n');
+            } else if (request.method === 'tools/call' && request.params.name === 'get-forecast') {
+              // Mock weather response based on region ID
+              const regionId = request.params.arguments.regionId;
+              let cityName = '東京'; // default
+              
+              // Simple mapping for common region IDs
+              if (regionId === '270000') cityName = '大阪';
+              else if (regionId === '230010') cityName = '名古屋';
+              
+              const weatherData = mockWeatherData[cityName] || mockWeatherData['東京'];
+              
+              const forecastText = `${cityName}の天気
+        今日:
+        天気: ${weatherData.conditions}
+        最高気温: ${weatherData.temperature.replace('℃', '')}℃
+        湿度: ${weatherData.humidity}
+        
+        ${weatherData.description}`;
+              
+              const response = {
+                jsonrpc: '2.0',
+                id: request.id,
+                result: {
+                  content: [
+                    {
+                      type: 'text',
+                      text: forecastText
+                    }
+                  ]
+                }
+              };
+              process.stdout.write(JSON.stringify(response) + '\n');
+            } else if (request.method === 'initialize') {
+              const response = {
+                jsonrpc: '2.0',
+                id: request.id,
+                result: {
+                  protocolVersion: '2024-11-05',
+                  capabilities: {
+                    tools: {}
+                  },
+                  serverInfo: {
+                    name: 'mock-weather-server',
+                    version: '1.0.0'
+                  }
+                }
+              };
+              process.stdout.write(JSON.stringify(response) + '\n');
+            }
+          } catch (error) {
+            // Ignore parsing errors
+          }
+        });
+        
+        // Keep the process alive
+        process.stdin.resume();
+        EOF
+        chmod +x mock-weather-server-ci.js
+    
+    - name: Run Playwright tests
+      run: |
+        # Mask sensitive information in logs
+        echo "::add-mask::${{ secrets.ANTHROPIC_API_KEY }}"
+        npm test
+      env:
+        CI: true
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'test-key-for-ci' }}
+        # Disable verbose logging to prevent path exposure
+        NODE_ENV: production
+        DEBUG: ""
+    
+    - name: Upload Playwright Report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: playwright-report-node-${{ matrix.node-version }}
+        path: playwright-report/
+        retention-days: 30
+    
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-node-${{ matrix.node-version }}
+        path: test-results/
+        retention-days: 30
+
+  # Optional: Deploy test results to GitHub Pages
+  deploy-report:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always() && github.ref == 'refs/heads/main'
+    
+    permissions:
+      pages: write
+      id-token: write
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+    - name: Download Playwright Report
+      uses: actions/download-artifact@v4
+      with:
+        name: playwright-report-node-20.x
+        path: playwright-report
+    
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+    
+    - name: Upload to GitHub Pages
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: playwright-report
+    
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
